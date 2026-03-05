@@ -9,6 +9,8 @@ PROJECT_SUBDIR="${PROJECT_SUBDIR:-web}"
 REPO_URL="${REPO_URL:-}"
 BRANCH="${BRANCH:-main}"
 NODE_MAJOR="${NODE_MAJOR:-20}"
+NGINX_PORT="${NGINX_PORT:-80}"
+REMOVE_NGINX_DEFAULT_SITE="${REMOVE_NGINX_DEFAULT_SITE:-false}"
 
 log() {
   echo "[deploy] $*"
@@ -19,12 +21,33 @@ fail() {
   exit 1
 }
 
+apt_update_retry() {
+  local max_retries=3
+  local attempt=1
+
+  while [[ ${attempt} -le ${max_retries} ]]; do
+    if sudo apt-get update -y; then
+      return 0
+    fi
+
+    log "apt-get update failed (attempt ${attempt}/${max_retries}), retrying..."
+    if [[ -f /etc/apt/sources.list.d/nodesource.list ]]; then
+      # NodeSource sometimes has transient index mismatch during mirror sync.
+      sudo rm -f /var/lib/apt/lists/*nodesource* >/dev/null 2>&1 || true
+    fi
+    sleep $((attempt * 5))
+    attempt=$((attempt + 1))
+  done
+
+  return 1
+}
+
 if ! command -v sudo >/dev/null 2>&1; then
   fail "sudo is required"
 fi
 
 log "Installing system packages..."
-sudo apt-get update -y
+apt_update_retry || fail "apt-get update failed after retries"
 sudo apt-get install -y curl git nginx build-essential
 
 install_node=true
@@ -38,6 +61,7 @@ fi
 if [[ "${install_node}" == "true" ]]; then
   log "Installing Node.js ${NODE_MAJOR}.x..."
   curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | sudo -E bash -
+  apt_update_retry || fail "apt-get update failed after NodeSource setup"
   sudo apt-get install -y nodejs
 fi
 
@@ -94,12 +118,12 @@ fi
 pm2 save
 sudo env PATH="$PATH" pm2 startup systemd -u "${USER}" --hp "${HOME}" >/dev/null 2>&1 || true
 
-log "Configuring Nginx reverse proxy..."
+log "Configuring Nginx reverse proxy on port ${NGINX_PORT}..."
 NGINX_CONF="/etc/nginx/sites-available/${APP_NAME}"
 sudo tee "${NGINX_CONF}" >/dev/null <<EOF
 server {
-    listen 80;
-    listen [::]:80;
+    listen ${NGINX_PORT};
+    listen [::]:${NGINX_PORT};
     server_name ${SERVER_IP};
 
     location / {
@@ -116,7 +140,7 @@ server {
 EOF
 
 sudo ln -sfn "${NGINX_CONF}" "/etc/nginx/sites-enabled/${APP_NAME}"
-if [[ -f /etc/nginx/sites-enabled/default ]]; then
+if [[ "${REMOVE_NGINX_DEFAULT_SITE}" == "true" ]] && [[ -f /etc/nginx/sites-enabled/default ]]; then
   sudo rm -f /etc/nginx/sites-enabled/default
 fi
 
@@ -130,5 +154,9 @@ if command -v ufw >/dev/null 2>&1; then
 fi
 
 log "Deployment finished."
-log "Open: http://${SERVER_IP}"
+if [[ "${NGINX_PORT}" == "80" ]]; then
+  log "Open: http://${SERVER_IP}"
+else
+  log "Open: http://${SERVER_IP}:${NGINX_PORT}"
+fi
 pm2 status "${APP_NAME}"
